@@ -17,3 +17,5 @@ redis_data/
 pytest_cache/
 
 alembic/versions/*.pyc
+__pycache__/
+*.pyc
