@@ -1,0 +1,138 @@
+
+services:
+  # ──────────────────────────────────────────────
+  # AML API Application
+  # ──────────────────────────────────────────────
+  aml_api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────
+  # Celery Worker (async screening tasks)
+  # ──────────────────────────────────────────────
+  aml_worker:
+    build: .
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4 -Q aml_screening,aml_batch
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # Celery Beat (scheduled jobs: batch screening, CDD reviews)
+  # ──────────────────────────────────────────────
+  aml_beat:
+    build: .
+    command: celery -A app.tasks.celery_app beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - rabbitmq
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # PostgreSQL (partitioned, with PG audit extension)
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aml
+      POSTGRES_PASSWORD: aml_secret
+      POSTGRES_DB: aml_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aml -d aml_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+        -c log_statement=all
+        -c log_min_duration_statement=500
+        -c shared_preload_libraries='pg_stat_statements'
+
+  # ──────────────────────────────────────────────
+  # Redis (velocity counters + session)
+  # ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy volatile-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────
+  # RabbitMQ (Celery broker)
+  # ──────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: aml
+      RABBITMQ_DEFAULT_PASS: aml_rabbit
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ──────────────────────────────────────────────
+  # Prometheus + Grafana (observability)
+  # ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: aml_grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  grafana_data:
